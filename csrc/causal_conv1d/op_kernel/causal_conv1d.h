@@ -30,6 +30,57 @@ namespace NsCausalConv1d {
 using namespace AscendC;
 using namespace NsCausalConv1dCommon;
 
+template <typename T>
+__aicore__ inline void RoundedInputSilu(LocalTensor<T> dst, LocalTensor<T> roundedInputT,
+                                        LocalTensor<float> roundedInputF, LocalTensor<float> inputF,
+                                        uint32_t dataCount)
+{
+#if defined(__DAV_C220_VEC__)
+    if constexpr (IsSameType<T, bfloat16_t>::value) {
+        set_mask_count();
+        set_vector_mask(0, dataCount);
+        AscendC::CastImpl<bfloat16_t, float, false>(
+            (__ubuf__ bfloat16_t *)roundedInputT.GetPhyAddr(), (__ubuf__ float *)inputF.GetPhyAddr(),
+            RoundMode::CAST_RINT,
+            static_cast<uint64_t>(0), 1,
+            {1, 1, DEFAULT_REPEAT_STRIDE / 2, DEFAULT_REPEAT_STRIDE});
+        PipeBarrier<PIPE_V>();
+        AscendC::CastImpl<float, bfloat16_t, false>(
+            (__ubuf__ float *)roundedInputF.GetPhyAddr(), (__ubuf__ bfloat16_t *)roundedInputT.GetPhyAddr(),
+            RoundMode::CAST_NONE,
+            static_cast<uint64_t>(0), 1,
+            {1, 1, DEFAULT_REPEAT_STRIDE, DEFAULT_REPEAT_STRIDE / 2});
+        PipeBarrier<PIPE_V>();
+
+        const UnaryRepeatParams unaryParams;
+        const BinaryRepeatParams binaryParams;
+        Muls<float, false>(inputF, roundedInputF, -1.0f, MASK_PLACEHOLDER, 1, unaryParams);
+        PipeBarrier<PIPE_V>();
+        Exp<float, false>(inputF, inputF, MASK_PLACEHOLDER, 1, unaryParams);
+        PipeBarrier<PIPE_V>();
+        Adds<float, false>(inputF, inputF, 1.0f, MASK_PLACEHOLDER, 1, unaryParams);
+        PipeBarrier<PIPE_V>();
+        Div<float, false>(inputF, roundedInputF, inputF, MASK_PLACEHOLDER, 1, binaryParams);
+        PipeBarrier<PIPE_V>();
+
+        AscendC::CastImpl<bfloat16_t, float, false>(
+            (__ubuf__ bfloat16_t *)dst.GetPhyAddr(), (__ubuf__ float *)inputF.GetPhyAddr(), RoundMode::CAST_RINT,
+            static_cast<uint64_t>(0), 1,
+            {1, 1, DEFAULT_REPEAT_STRIDE / 2, DEFAULT_REPEAT_STRIDE});
+        set_mask_norm();
+        set_vector_mask(static_cast<uint64_t>(-1), static_cast<uint64_t>(-1));
+        return;
+    }
+#endif
+    Cast(roundedInputT, inputF, RoundMode::CAST_RINT, dataCount);
+    PipeBarrier<PIPE_V>();
+    Cast(roundedInputF, roundedInputT, RoundMode::CAST_NONE, dataCount);
+    PipeBarrier<PIPE_V>();
+    Silu(inputF, roundedInputF, dataCount);
+    PipeBarrier<PIPE_V>();
+    Cast(dst, inputF, RoundMode::CAST_RINT, dataCount);
+}
+
 #define CAUSAL_CONV1D_TEMPLATE_ARGS typename T, uint32_t runModeKey, uint32_t widthKey, uint32_t fnPlanKey
 #define CAUSAL_CONV1D_CLASS CausalConv1d<T, runModeKey, widthKey, fnPlanKey>
 
@@ -157,6 +208,8 @@ protected:
     __aicore__ inline void MaybeWriteBackSeqSplitTailChunk(int32_t chunkStart, int32_t chunkLen, int32_t seqStart,
                                                            int32_t seqLen, int32_t cacheIdx, int32_t channelStart,
                                                            int32_t baseDim, int32_t dim);
+    __aicore__ inline void ZeroFnOutputRange(int32_t tokenStart, int32_t tokenEnd, int32_t channelStart,
+                                             int32_t baseDim, int32_t dim);
     __aicore__ inline void ProcessDefault();
     template <int32_t kWindowMode>
     __aicore__ inline void ProcessDefaultByWindowMode();
@@ -398,8 +451,13 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
     LocalTensor<float> &biasF = cl.biasF;
     LocalTensor<float> &accF = cl.accF;
     LocalTensor<float> &tmpF = cl.tmpF;
+    LocalTensor<float> &currF = cl.currF;
     LocalTensor<T> ring = inBuf.Get<T>();
     LocalTensor<T> outT = outBuf.Get<T>();
+    LocalTensor<T> activationInputT;
+    if constexpr (!IsSameType<T, float>::value) {
+        activationInputT = currF.ReinterpretCast<T>();
+    }
     const bool hasBias = HasBias();
     const bool hasActivation = HasActivation();
     for (int32_t t = 0; t < len; ++t) {
@@ -416,7 +474,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
         }
 
         bool accInitialized = false;
-        if (hasBias) {
+        if (hasBias && !kIsUpdateMode) {
             Adds(accF, biasF, 0.0f, baseDim);
             PipeBarrier<PIPE_V>();
             accInitialized = true;
@@ -437,8 +495,22 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
 
         PipeBarrier<PIPE_V>();
 
+        if constexpr (kIsUpdateMode) {
+            if (hasBias) {
+                // Match PR651/Triton update arithmetic: accumulate every
+                // convolution tap first, then add bias.  Initializing the
+                // accumulator from bias changes the FP32 rounding path; the
+                // resulting rare BF16 one-ULP differences accumulate across
+                // GDN layers and long decode chains.
+                Add(accF, accF, biasF, baseDim);
+                PipeBarrier<PIPE_V>();
+            }
+        }
+
         if (hasActivation) {
-            Silu(tmpF, accF, baseDim);
+            if constexpr (IsSameType<T, float>::value) {
+                Silu(tmpF, accF, baseDim);
+            }
         }
 
         const int32_t outSlot = t & 1;
@@ -455,7 +527,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
             }
         } else {
             if (hasActivation) {
-                Cast(outSlotT, tmpF, RoundMode::CAST_RINT, baseDim);
+                RoundedInputSilu(outSlotT, activationInputT, tmpF, accF, baseDim);
             } else {
                 Cast(outSlotT, accF, RoundMode::CAST_RINT, baseDim);
             }
@@ -570,7 +642,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::ComputeFnRollingOutput(int32_t slotC
     PipeBarrier<PIPE_V>();
 
     const bool hasActivation = HasActivation();
-    if (hasActivation) {
+    if (hasActivation && IsSameType<T, float>::value) {
         PipeBarrier<PIPE_V>();
         Silu(currF, state0F, baseDim);
     }
@@ -673,7 +745,18 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
             }
         } else {
             if (hasActivation) {
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+                // RegBase rounded the FP32 convolution accumulator to T and
+                // expanded it again before producing currF = SiLU(input).
                 Cast(outSlotT, currF, RoundMode::CAST_RINT, baseDim);
+#else
+                // Use the output buffer as the temporary T checkpoint.  This
+                // mirrors BF16 F.conv1d -> BF16 SiLU instead of applying SiLU
+                // directly to the FP32 accumulator.  The old behavior made
+                // run_mode=0 prefill diverge from run_mode=1 update at every
+                // GDN layer and the error accumulated into garbled decoding.
+                RoundedInputSilu(outSlotT, outSlotT, currF, state0F, baseDim);
+#endif
             } else {
                 Cast(outSlotT, state0F, RoundMode::CAST_RINT, baseDim);
             }
